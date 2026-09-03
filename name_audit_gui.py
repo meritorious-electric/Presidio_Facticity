@@ -80,11 +80,17 @@ class NameAuditApp(tk.Tk):
         style.configure(".", font=FONT, background="#fafafa")
         style.configure("TButton", padding=6)
         style.configure("Accent.TButton", padding=8)
+        style.configure("Link.TButton", padding=2)
+        self.style = style
 
         self.pdf_folder = tk.StringVar()
         self.out_csv = tk.StringVar()
         self.cache_dir = tk.StringVar(value=".name_audit_cache")
+        self.gazetteer = tk.StringVar()
+        self.gazetteer_ambiguous = tk.StringVar()
+        self.denylist = tk.StringVar()
         self.status = tk.StringVar(value="Ready.")
+        self._advanced_visible = False
 
         self._log_queue = queue.Queue()
         self._running = False
@@ -135,6 +141,35 @@ class NameAuditApp(tk.Tk):
         row3.pack(fill="x", pady=(0, 8))
         ttk.Label(row3, text="Cache folder (optional — separate projects should use different ones)").pack(anchor="w")
         ttk.Entry(row3, textvariable=self.cache_dir).pack(fill="x", pady=(2, 0))
+
+        # Advanced toggle
+        self.advanced_toggle = ttk.Button(
+            outer, text="▸ Advanced (gazetteer, denylist)",
+            command=self._toggle_advanced, style="Link.TButton",
+        )
+        self.advanced_toggle.pack(anchor="w", pady=(2, 4))
+
+        self.advanced_frame = ttk.Frame(outer)
+        # not packed initially -- shown via _toggle_advanced
+
+        def path_row(parent, label, var, note=""):
+            f = ttk.Frame(parent)
+            f.pack(fill="x", pady=(0, 8))
+            text = label + (f"  ({note})" if note else "")
+            ttk.Label(f, text=text).pack(anchor="w")
+            g = ttk.Frame(f)
+            g.pack(fill="x", pady=(2, 0))
+            ttk.Entry(g, textvariable=var).pack(side="left", fill="x", expand=True)
+            ttk.Button(g, text="File…", width=6,
+                       command=lambda: self._pick_into(var, folder=False)).pack(side="left", padx=(4, 0))
+            ttk.Button(g, text="Folder…", width=8,
+                       command=lambda: self._pick_into(var, folder=True)).pack(side="left", padx=(4, 0))
+
+        path_row(self.advanced_frame, "Gazetteer", self.gazetteer,
+                 "Census/SSA names run through prepare_gazetteer.py")
+        path_row(self.advanced_frame, "Gazetteer — ambiguous list", self.gazetteer_ambiguous)
+        path_row(self.advanced_frame, "Denylist", self.denylist,
+                 "corpus-specific noise: drug names, product lines, etc.")
 
         # Buttons
         row4 = ttk.Frame(outer)
@@ -206,6 +241,24 @@ class NameAuditApp(tk.Tk):
 
         self.after(0, finish)
 
+    # -- advanced section ---------------------------------------------
+    def _toggle_advanced(self):
+        self._advanced_visible = not self._advanced_visible
+        if self._advanced_visible:
+            self.advanced_frame.pack(fill="x", after=self.advanced_toggle)
+            self.advanced_toggle.config(text="▾ Advanced (gazetteer, denylist)")
+        else:
+            self.advanced_frame.pack_forget()
+            self.advanced_toggle.config(text="▸ Advanced (gazetteer, denylist)")
+
+    def _pick_into(self, var, folder):
+        if folder:
+            path = filedialog.askdirectory(title="Select folder")
+        else:
+            path = filedialog.askopenfilename(title="Select file")
+        if path:
+            var.set(path)
+
     # -- pickers -----------------------------------------------------
     def _pick_pdf_folder(self):
         path = filedialog.askdirectory(title="Select folder of OCR'd PDFs")
@@ -240,6 +293,10 @@ class NameAuditApp(tk.Tk):
             sys.executable, str(TARGET_SCRIPT), "all", folder,
             "--out", out, "--cache-dir", cache,
         ]
+        cmd += self._path_flags("--gazetteer", self.gazetteer.get())
+        cmd += self._path_flags("--gazetteer-ambiguous", self.gazetteer_ambiguous.get())
+        cmd += self._path_flags("--denylist", self.denylist.get())
+
         self._set_running_state(True, allow_run=False)
         self.status.set("Scanning… this can take a while for large batches.")
         threading.Thread(target=self._run_worker, args=(cmd, "Scan complete."), daemon=True).start()
@@ -254,6 +311,17 @@ class NameAuditApp(tk.Tk):
         self._set_running_state(True, allow_run=False)
         self.status.set("Clearing cache…")
         threading.Thread(target=self._run_worker, args=(cmd, "Cache cleared."), daemon=True).start()
+
+    @staticmethod
+    def _path_flags(flag, value):
+        """Turn a semicolon-separated field into repeated --flag entries
+        (the underlying script accepts --gazetteer etc. multiple times)."""
+        flags = []
+        for part in value.split(";"):
+            part = part.strip()
+            if part:
+                flags += [flag, part]
+        return flags
 
     def _run_worker(self, cmd, done_message):
         ok = self._stream_subprocess(cmd)

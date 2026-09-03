@@ -64,7 +64,7 @@ names_report.csv
     name, tier, confidence, possible_minor, occurrence_count, file_count,
     locations, possible_duplicate_of, recognizer, minor_tier,
     minor_binding, minor_reason, suppressed, suppress_reason,
-    also_reported_as
+    also_reported_as, suppressed_fraction, rescued_from
 
 names_report.suppressed.csv
     Same columns, holding the rows this run withheld from the main
@@ -124,7 +124,11 @@ names_report.suppressed.csv
 
     A name is withheld only if EVERY occurrence of it was suppressed.
     One clean sighting rescues it: "Bell" following "syndrome" on page 4
-    does not erase Nurse Bell on page 9.
+    does not erase Nurse Bell on page 9. The rescue is graded, though:
+    suppressed_fraction reports how much of the name was withheld, and
+    a name that was mostly suppressed is capped at light_review (>= 50%)
+    or extensive_review (>= 80%). rescued_from lists the rules that
+    fired on the suppressed occurrences.
 
     also_reported_as shows what was folded into a row -- the untrimmed
     surface form, and any surname-first variant merged into it -- so
@@ -295,7 +299,12 @@ DEFAULT_MODEL = "en_core_web_lg"
 # suppression verdicts and flipped-name detection change under this
 # version; a v5 shard's cached suppress_reason/flip results predate all
 # four fixes and must not be trusted without a rescan.
-EXTRACTOR_VERSION = 6
+# v7 = newline no longer a sentence boundary for the eponym lookahead
+# (head nouns on the next visual line were invisible); fuzzy eponym
+# matching; clinical-cue and ICD-adjacency medical rules; institutional
+# lookahead past the span end for org suppression; gazetteer-trained
+# character n-gram model for OCR debris. Every suppress_reason changes.
+EXTRACTOR_VERSION = 7
 
 # Gazetteer-only detections land at this score by default. NOTE: the work
 # order said "defaulting to 0.55" and, in the same sentence, that a score
@@ -643,6 +652,73 @@ MEDICAL_EPONYMS = {
 # candidate, not a change in what counts as "immediately adjacent".
 MEDICAL_LOOKAHEAD = 72
 
+# ---------------------------------------------------------------------
+# Fuzzy eponym matching (v7). OCR and clinicians both misspell eponyms
+# -- "Klinfelter", "Aspberger", "Alzhiemer" -- and an exact-match list
+# missed every one of them. A token of FUZZY_EPONYM_MIN_LEN+ letters
+# that scores >= FUZZY_EPONYM_RATIO against an eponym of similar length
+# counts as that eponym. Short eponyms (Bell, Down, Rett, Reye) stay
+# exact: at four letters a 90% ratio is a one-letter edit, and Ball,
+# Dawn and Rott are people.
+# ---------------------------------------------------------------------
+FUZZY_EPONYM_MIN_LEN = 7
+FUZZY_EPONYM_RATIO = 90
+_LONG_EPONYMS = sorted(e for e in MEDICAL_EPONYMS
+                       if len(e) >= FUZZY_EPONYM_MIN_LEN and " " not in e)
+
+
+def _eponym_match(token: str):
+    """The eponym `token` names, exactly or fuzzily, or None."""
+    if not token:
+        return None
+    if token in MEDICAL_EPONYMS:
+        return token
+    if len(token) < FUZZY_EPONYM_MIN_LEN:
+        return None
+    try:
+        from rapidfuzz import fuzz, process
+        hit = process.extractOne(token, _LONG_EPONYMS, scorer=fuzz.ratio,
+                                 score_cutoff=FUZZY_EPONYM_RATIO)
+        return hit[0] if hit else None
+    except ImportError:
+        from difflib import SequenceMatcher
+        best, best_ratio = None, 0.0
+        for e in _LONG_EPONYMS:
+            r = SequenceMatcher(None, token, e).ratio() * 100
+            if r > best_ratio:
+                best, best_ratio = e, r
+        return best if best_ratio >= FUZZY_EPONYM_RATIO else None
+
+
+# Clinical cues that introduce a diagnosis rather than a person. Anchored
+# to the END of the text preceding the span, so only the cue actually
+# adjacent to it binds -- "Dx: Klinefelter", "r/o Marfan", "hx of Crohn",
+# "s/p Nissen", "consistent with Cushing". "Patient:" and "Re:" are
+# deliberately absent; those introduce people.
+CLINICAL_CUES = {
+    "dx", "diagnosis", "diagnoses", "diagnosed with", "dx of",
+    "r/o", "rule out", "ruled out", "hx", "hx of", "history of",
+    "pmh", "pmhx", "fhx", "family history of", "s/p", "status post",
+    "positive for", "negative for", "consistent with", "suggestive of",
+    "suspected", "presents with", "presenting with", "workup for",
+    "evaluation for", "screen for", "screening for", "treated for",
+    "impression", "assessment", "problem list",
+}
+CLINICAL_CUE_LOOKBACK = 32
+CLINICAL_CUE_BEFORE_RE = re.compile(
+    r"\b(" + "|".join(
+        r"\s+".join(re.escape(w) for w in cue.split())
+        for cue in sorted(CLINICAL_CUES, key=len, reverse=True)
+    ) + r")\s*[:\-]?\s*(?:of\s+)?$",
+    re.IGNORECASE,
+)
+
+# ICD-10-CM shape: letter, two digits, optional dot and 1-4 more
+# characters. "Q98.4", "F84.0", "E11.9", "M32". Case-sensitive on the
+# leading letter so "e11" in a serial number cannot match.
+ICD10_RE = re.compile(r"(?<![A-Za-z0-9])[A-TV-Z]\d{2}(?:\.[0-9A-Za-z]{1,4})?(?![A-Za-z0-9])")
+ICD_ADJACENCY = 16
+
 # Terms that ASSERT the nearby name belongs to a child. Every term in the
 # old set that merely established a child was somewhere in the document
 # has been removed, because that is a property of the page, not of the
@@ -831,6 +907,7 @@ BIND_TIER = {
 SINGLE_TOKEN_PENALTY = 0.15   # "Reyes" alone is more ambiguous than "Jon Reyes", useful for product names
 CASE_ANOMALY_PENALTY = 0.10   # ALL CAPS / all lowercase often = headers, OCR noise
 DIGIT_PENALTY = 0.30          # digits inside a "name" are almost always misfires
+NGRAM_PENALTY = 0.15          # token implausible under the gazetteer trigram model (v7)
 
 # Pages fed to spaCy's pipe() per batch inside a chunk. Distinct from
 # --chunk-size, which is the checkpoint/commit granularity.
@@ -1305,6 +1382,12 @@ def shape_adjustment(name: str) -> float:
     letters = [ch for ch in name if ch.isalpha()]
     if letters and (name == name.upper() or name == name.lower()):
         penalty += CASE_ANOMALY_PENALTY
+    # v7: a token the gazetteer trigram model finds implausible re-tiers
+    # the row even when nothing convicts it. Removal is garbage_verdict's
+    # job; this only moves the hit toward human eyes.
+    if _NGRAM_MODEL is not None and any(
+            _NGRAM_MODEL.implausible(t) for t in tokens):
+        penalty += NGRAM_PENALTY
     return -penalty
 
 
@@ -1494,6 +1577,11 @@ def garbage_signals(name: str):
             signals.append("alnum_mixed_token")
         if not _is_latin(tok):
             continue
+        # Whole-string plausibility from the gazetteer trigram model
+        # (v7). Weak signal here; garbage_verdict decides whether it
+        # convicts. See the note above NameNgramModel.
+        if _NGRAM_MODEL is not None and _NGRAM_MODEL.implausible(tok):
+            signals.append("implausible_ngrams")
         low = "".join(alpha).lower()
         if len(low) >= GARBAGE_VOWELLESS_MIN_LEN and not any(c in _VOWELS for c in low):
             signals.append("vowelless_token")
@@ -1514,18 +1602,47 @@ def garbage_signals(name: str):
 
 
 def garbage_verdict(name: str) -> str:
-    """Suppression reason detail for OCR debris, or "" to keep the hit."""
+    """
+    Suppression reason detail for OCR debris, or "" to keep the hit.
+
+    Three routes to a conviction: a severe (interior-garbage) signal;
+    two independent weak signals; or -- v7 -- a token whose trigram
+    score falls below the STRICT n-gram threshold when NO token of the
+    span is a gazetteer member. That last pairing is deliberate: the
+    n-gram score is one observation and dictionary absence another, and
+    a span that fails both with nothing to rescue it is debris.
+    "not_in_gazetteer" is never a general-purpose signal, because a real
+    but unlisted surname plus any one orthographic quirk ("Krzysztof"
+    has a seven-consonant run) would otherwise convict a person.
+    """
     severe, signals = garbage_signals(name)
     if severe:
         return ",".join(signals)
     if len(signals) >= 2:
         return ",".join(signals)
+    if (_NGRAM_MODEL is not None and _GAZETTEER_NAMES
+            and _NGRAM_MODEL.calibration_size >= NGRAM_MIN_TRAINING_NAMES
+            and "implausible_ngrams" in signals):
+        toks = name.split()
+        if (not any(_token_in_gazetteer(t, _GAZETTEER_NAMES) for t in toks)
+                and any(_NGRAM_MODEL.condemnable(t) for t in toks)):
+            return "implausible_ngrams,not_in_gazetteer"
     return ""
 
 
-def org_verdict(name: str, entity_overlaps=()) -> str:
+def org_verdict(name: str, entity_overlaps=(), ctx_text: str = "",
+                end: int = 0) -> str:
     """
     Suppression reason detail for an organisation, or "".
+
+    v7: the span's immediate RIGHT context is read as well as its
+    tokens. spaCy habitually returns "John" for "St. John Hospital" and
+    "Mercy" for "Mercy Regional Medical Center", leaving the token that
+    gives the game away just outside the span. A strong institutional
+    term within ORG_LOOKAHEAD_MAX_TOKENS capitalised tokens of the span
+    end convicts on its own; a weak one there corroborates a weak term
+    inside the span. See _institutional_term_after for why running
+    prose ("...was admitted to Mercy Hospital") cannot reach in.
 
     Two independent routes in, plus a third that is NOT independent:
 
@@ -1559,6 +1676,24 @@ def org_verdict(name: str, entity_overlaps=()) -> str:
     if strong:
         return "institutional_term:" + "+".join(strong)
 
+    strong_after, weak_after = _institutional_term_after(ctx_text, end)
+    if strong_after:
+        return "following_institutional_term:" + strong_after
+
+    # A weak term just after the span counts as one more weak token, no
+    # more: it must still reach the three-weak-term bar or find an
+    # org construction, so "Grace Hall" followed by "Memorial" is not
+    # convicted on two weak words.
+    # Following weak terms count only in company: two or more
+    # capitalised institution-flavoured words after the span ("Mercy
+    # Regional Medical Center") are a name; one ("Grace Hall Memorial
+    # Day") is a coincidence, and Grace Hall is a person.
+    weak_after = [w for w in weak_after if w not in weak]
+    if len(weak_after) >= 2:
+        weak = sorted(set(weak) | set(weak_after))
+    else:
+        weak_after = []
+
     corroboration = []
     # THREE weak terms, not two. "Grace Hall", "Park Hill" and
     # "Summer Church" are all plausible people; "Mercy Valley Health"
@@ -1573,6 +1708,7 @@ def org_verdict(name: str, entity_overlaps=()) -> str:
 
     if weak and corroboration:
         return ("weak_term:" + "+".join(weak)
+                + ("|after:" + "+".join(sorted(set(weak_after))) if weak_after else "")
                 + "|" + "+".join(sorted(set(corroboration))))
 
     hard_ner = overlaps & {"ORGANIZATION", "ORG", "NRP"}
@@ -1591,11 +1727,49 @@ def org_verdict(name: str, entity_overlaps=()) -> str:
     return ""
 
 
-_SENTENCE_BOUNDARY_RE = re.compile(r"[.!?;\n]")
+# v7: the newline was REMOVED from this class. pdfplumber emits "\n" at
+# every visual line, so with it in place the lookahead only ever saw the
+# rest of the current line -- "Klinefelter" at a line end with "syndrome"
+# on the next never found its head noun. A visual line break is a layout
+# fact, not a sentence boundary; .!?; still are.
+_SENTENCE_BOUNDARY_RE = re.compile(r"[.!?;]")
 _WORD_RE = re.compile(r"[^\W\d_][\u2019']?[\w\u2019'\-]*", re.UNICODE)
 
+# How many tokens after a MULTI-token span a head noun may sit. A
+# single-token or possessive span ("Asperger's or other developmental
+# eponymous syndrome") gets the full MEDICAL_LOOKAHEAD search; a
+# two-token span is far more often a person, and "John Smith presented
+# with Down syndrome" must not lose John Smith to a head noun nine words
+# away. "Ehlers Danlos syndrome" and "Lou Gehrig disease" keep their head
+# noun adjacent, so a tight budget costs nothing there.
+MEDICAL_MULTI_TOKEN_MAX_GAP = 2
 
-def _head_noun_within(ctx_text: str, end: int, limit: int = MEDICAL_LOOKAHEAD):
+# Institutional lookahead is tighter still: only capitalised tokens (and
+# "of"/"&"/"the") may sit between the span and the institutional term, so
+# "St. John Hospital" and "Mercy Regional Medical Center" fire while "John
+# Smith was admitted to Mercy Hospital" stops dead at "was".
+ORG_LOOKAHEAD_MAX_TOKENS = 4
+_ORG_LINKER_WORDS = {"of", "and", "&", "the", "for", "de", "du", "del"}
+
+
+def _tokens_after(ctx_text: str, end: int, limit: int):
+    """
+    Word tokens in the bounded window after a span, cut at the first
+    sentence boundary. The window is passed through normalize_context()
+    first, so a hyphenated line break ("Klin-\\nfelter syn-\\ndrome") and a
+    wrapped line both read as flat prose.
+    """
+    if not ctx_text or not end:
+        return []
+    window = normalize_context(ctx_text[end:end + limit])
+    m = _SENTENCE_BOUNDARY_RE.search(window)
+    if m:
+        window = window[:m.start()]
+    return _WORD_RE.findall(window)
+
+
+def _head_noun_within(ctx_text: str, end: int, limit: int = MEDICAL_LOOKAHEAD,
+                      max_gap=None):
     """
     Search a bounded window after a span for a medical/eponym head noun,
     rather than requiring one to be the very next token.
@@ -1607,22 +1781,48 @@ def _head_noun_within(ctx_text: str, end: int, limit: int = MEDICAL_LOOKAHEAD):
     noun immediately adjacent; real chart prose is not always that
     considerate.
 
-    The window is cut at the first sentence boundary (.!?; or newline)
-    so a search starting near the end of one sentence cannot wander into
-    an unrelated clause two sentences later and find a head noun that
-    has nothing to do with the eponym in question.
+    The window is cut at the first sentence boundary (.!?) so a search
+    starting near the end of one sentence cannot wander into an
+    unrelated clause and find a head noun that has nothing to do with
+    the eponym in question. Line breaks are NOT boundaries (see
+    _SENTENCE_BOUNDARY_RE). `max_gap`, when given, caps how many tokens
+    may precede the head noun.
     """
-    if not ctx_text or not end:
-        return None
-    window = ctx_text[end:end + limit]
-    m = _SENTENCE_BOUNDARY_RE.search(window)
-    if m:
-        window = window[:m.start()]
-    for tok in _WORD_RE.findall(window):
+    for i, tok in enumerate(_tokens_after(ctx_text, end, limit)):
+        if max_gap is not None and i > max_gap:
+            break
         norm = tok.lower().strip(_NAME_TOKEN_STRIP)
         if norm in MEDICAL_HEAD_NOUNS:
             return norm
     return None
+
+
+def _institutional_term_after(ctx_text: str, end: int):
+    """
+    (strong_term, [weak_terms]) found immediately after a span, or ("", []).
+    spaCy routinely returns "John" as the PERSON in "St. John Hospital",
+    leaving the institutional token just outside the span where
+    org_verdict's token test could never see it. Only capitalised tokens
+    and a few linker words may intervene, so running prose about a
+    person being admitted somewhere does not qualify.
+    """
+    weak = []
+    for i, tok in enumerate(_tokens_after(ctx_text, end, 80)):
+        if i >= ORG_LOOKAHEAD_MAX_TOKENS:
+            break
+        norm = tok.lower().strip(_NAME_TOKEN_STRIP)
+        if norm in _ORG_LINKER_WORDS:
+            continue
+        # Only a CAPITALISED term is part of a proper name. "St. John's
+        # Hospital" convicts; "Dr. Turney's office" and "Smith's company"
+        # are a person followed by a common noun, and stop the walk.
+        if not tok[:1].isupper():
+            break
+        if norm in INSTITUTIONAL_TERMS:
+            return norm, weak
+        if norm in INSTITUTIONAL_WEAK_TERMS:
+            weak.append(norm)
+    return "", weak
 
 
 def medical_verdict(name: str, ctx_text: str = "", start: int = 0,
@@ -1646,21 +1846,55 @@ def medical_verdict(name: str, ctx_text: str = "", start: int = 0,
     if toks[-1] in MEDICAL_HEAD_NOUNS:
         return "head_noun:" + toks[-1]
 
-    nxt = _head_noun_within(ctx_text, end)
-    if nxt:
-        return "following_head_noun:" + nxt
-
     # Possessive eponym embedded IN the detected span: "Down's",
     # "Crohn's", "Alzheimer's" -- the tokenizer kept the "'s" attached.
+    # Resolved before the head-noun search so the gap budget below can
+    # tell a possessive span from a plain multi-token one.
     raw_toks = [t.strip(_NAME_TOKEN_STRIP.replace("'", "").replace("’", ""))
                 for t in name.split()]
+    possessive = False
     for tok in raw_toks:
         low = tok.lower()
         for suffix in ("'s", "’s", "s'", "s’"):
             if low.endswith(suffix):
+                possessive = True
                 base = low[: -len(suffix)].strip(_NAME_TOKEN_STRIP)
-                if base in MEDICAL_EPONYMS:
-                    return "possessive_eponym:" + base
+                matched = _eponym_match(base)
+                if matched:
+                    return "possessive_eponym:" + matched
+
+    # A single token or a possessive gets the full bounded search; a
+    # plain multi-token span must have its head noun within
+    # MEDICAL_MULTI_TOKEN_MAX_GAP tokens (see the constant).
+    gap = None if (len(toks) == 1 or possessive) else MEDICAL_MULTI_TOKEN_MAX_GAP
+    nxt = _head_noun_within(ctx_text, end, max_gap=gap)
+    if nxt:
+        return "following_head_noun:" + nxt
+
+    # Clinical cue immediately BEFORE the span: "Dx: Klinefelter",
+    # "r/o Marfan", "hx of Crohn", "s/p Whipple". No head noun, no
+    # possessive, so nothing above can see these. Limited to spans of
+    # one or two tokens -- "Dx: Ehlers Danlos" -- because a longer span
+    # after a cue is not a diagnosis name.
+    if ctx_text and start is not None and len(toks) <= 2:
+        before = normalize_context(
+            ctx_text[max(0, start - CLINICAL_CUE_LOOKBACK):start])
+        m = CLINICAL_CUE_BEFORE_RE.search(before)
+        if m:
+            return "clinical_cue:" + re.sub(r"\s+", " ", m.group(1).lower())
+
+    # ICD-10 code adjacent to the span. On its own this is NOT enough --
+    # a roster line "Smith, John   E11.9" puts a code beside a real
+    # patient -- so it convicts only a token that already resembles a
+    # known eponym (exact or fuzzy).
+    if ctx_text and end:
+        near = normalize_context(
+            ctx_text[max(0, start - ICD_ADJACENCY):end + ICD_ADJACENCY])
+        if ICD10_RE.search(near):
+            for t in toks:
+                matched = _eponym_match(t)
+                if matched:
+                    return "icd_adjacent_eponym:" + matched
 
     # Possessive eponym where the tokenizer SPLIT the possessive off,
     # ending the span right before it: "Graves' disease" (span ends at
@@ -1685,9 +1919,10 @@ def medical_verdict(name: str, ctx_text: str = "", start: int = 0,
     # regardless of the possessive -- but it remains as a safety net for
     # an eponym with no head noun nearby at all ("ruled out Wilson's on
     # follow-up").
-    if ctx_text and end and toks[-1] in MEDICAL_EPONYMS:
-        if ctx_text[end:end + 1] in ("'", "’"):
-            return "possessive_eponym:" + toks[-1]
+    if ctx_text and end and ctx_text[end:end + 1] in ("'", "’"):
+        matched = _eponym_match(toks[-1])
+        if matched:
+            return "possessive_eponym:" + matched
     return ""
 
 
@@ -1725,7 +1960,7 @@ def suppress_verdict(name: str, ctx_text: str = "", start: int = 0,
     detail = denylist_verdict(name, denylist)
     if detail:
         return SUPPRESS_DENYLIST, detail
-    detail = org_verdict(name, entity_overlaps)
+    detail = org_verdict(name, entity_overlaps, ctx_text, end)
     if detail:
         return SUPPRESS_ORG, detail
     detail = medical_verdict(name, ctx_text, start, end)
@@ -1843,6 +2078,137 @@ def normalize_gazetteer_token(tok: str) -> str:
     t = unicodedata.normalize("NFKD", tok)
     t = "".join(ch for ch in t if not unicodedata.combining(ch))
     return t.casefold().strip(_GAZ_STRIP)
+
+
+# ---------------------------------------------------------------------
+# Character n-gram plausibility (v7)
+#
+# The orthographic tells in garbage_signals are single-feature threshold
+# tests, and OCR debris slips between them: "Jcallhcj" has a vowel, a
+# consonant run of five (threshold six) and a double letter of two
+# (threshold three), so it produced no signal at all and landed in
+# light_review. What condemns it is that "jca", "lhc" and "hcj" do not
+# occur in names, while "sch", "kow" and "ngu" do -- a property of the
+# whole string, not of any one feature.
+#
+# The gazetteer already on hand is the training set: trigram counts over
+# ~150k real names, add-alpha smoothed, scored as mean log P(c | two
+# previous chars). Thresholds are calibrated on the gazetteer itself,
+# as percentiles of real-name scores, so they need no hand-tuning:
+#
+#   NGRAM_SIGNAL_PERCENTILE   below this, the token is a WEAK signal,
+#                             counted with the others in garbage_verdict
+#                             and penalised by shape_adjustment;
+#   NGRAM_CONVICT_PERCENTILE  below this AND no token of the span in the
+#                             gazetteer, the span is convicted outright.
+#
+# Two thresholds because the recall cost of the second is real: 0.1% of
+# genuine gazetteer names score below it, and a rare non-Anglo surname
+# absent from the Census file could too. Tokens under NGRAM_MIN_LETTERS
+# letters are never scored -- too little evidence either way -- and
+# non-Latin scripts are exempt, as with every orthographic test here.
+# Without a gazetteer the model is None and nothing changes.
+# ---------------------------------------------------------------------
+NGRAM_SIGNAL_PERCENTILE = 1.0
+NGRAM_CONVICT_PERCENTILE = 0.1
+NGRAM_MIN_LETTERS = 4
+NGRAM_ALPHA = 0.01
+# Below this many training names the percentile thresholds are too
+# coarse to trust for a conviction (a 700-name toy dictionary condemned
+# Tolkien and Brzezinski in testing). The model still emits the weak
+# signal and the shape penalty; it just never convicts on its own.
+NGRAM_MIN_TRAINING_NAMES = 20000
+_NGRAM_PAD_START = "\x02"
+_NGRAM_PAD_END = "\x03"
+
+
+class NameNgramModel:
+    """Trigram character model over gazetteer names; see the note above."""
+
+    def __init__(self, names, signal_pct=NGRAM_SIGNAL_PERCENTILE,
+                 convict_pct=NGRAM_CONVICT_PERCENTILE):
+        import math
+        self._log = math.log
+        tri = defaultdict(int)
+        bi = defaultdict(int)
+        alphabet = set()
+        for n in names:
+            s = self._prep(n)
+            if len(s) < 3:
+                continue
+            for ch in s:
+                alphabet.add(ch)
+            for i in range(2, len(s)):
+                tri[s[i - 2:i + 1]] += 1
+                bi[s[i - 2:i]] += 1
+        self.tri = dict(tri)
+        self.bi = dict(bi)
+        self.vocab = max(1, len(alphabet))
+        # Calibrate on the very names the model was built from. A
+        # percentile of real-name scores, not an absolute log-prob, so
+        # the threshold moves with the dictionary supplied.
+        scores = sorted(
+            sc for sc in (self.score(n) for n in names) if sc is not None)
+        self.signal_threshold = self._percentile(scores, signal_pct)
+        self.convict_threshold = self._percentile(scores, convict_pct)
+        self.calibration_size = len(scores)
+
+    @staticmethod
+    def _prep(token: str) -> str:
+        t = normalize_gazetteer_token(token)
+        t = "".join(ch for ch in t if ch.isalpha() or ch in "-'")
+        return _NGRAM_PAD_START * 2 + t + _NGRAM_PAD_END if t else ""
+
+    @staticmethod
+    def _percentile(sorted_scores, pct):
+        if not sorted_scores:
+            return float("-inf")
+        idx = int(len(sorted_scores) * pct / 100.0)
+        return sorted_scores[min(max(idx, 0), len(sorted_scores) - 1)]
+
+    def score(self, token: str):
+        """Mean log P(char | previous two), or None if unscorable."""
+        s = self._prep(token)
+        letters = sum(1 for ch in s if ch.isalpha())
+        if letters < NGRAM_MIN_LETTERS or not _is_latin(token):
+            return None
+        total = 0.0
+        n = 0
+        for i in range(2, len(s)):
+            ctx = s[i - 2:i]
+            num = self.tri.get(s[i - 2:i + 1], 0) + NGRAM_ALPHA
+            den = self.bi.get(ctx, 0) + NGRAM_ALPHA * self.vocab
+            total += self._log(num / den)
+            n += 1
+        return total / n if n else None
+
+    def implausible(self, token: str) -> bool:
+        sc = self.score(token)
+        return sc is not None and sc < self.signal_threshold
+
+    def condemnable(self, token: str) -> bool:
+        sc = self.score(token)
+        return sc is not None and sc < self.convict_threshold
+
+
+# Set per worker in scan_one_pdf once the gazetteer is loaded; module
+# globals because garbage_signals/shape_adjustment are called from deep
+# inside the scoring loop and threading a model through every signature
+# would touch a dozen call sites.
+_NGRAM_MODEL = None
+_GAZETTEER_NAMES = None
+
+
+def set_garbage_model(names):
+    """Build the n-gram model from a loaded gazetteer (or clear it)."""
+    global _NGRAM_MODEL, _GAZETTEER_NAMES
+    if names:
+        _GAZETTEER_NAMES = names
+        _NGRAM_MODEL = NameNgramModel(names)
+    else:
+        _GAZETTEER_NAMES = None
+        _NGRAM_MODEL = None
+    return _NGRAM_MODEL
 
 
 def _token_in_gazetteer(tok: str, names: frozenset) -> bool:
@@ -2590,6 +2956,10 @@ def scan_one_pdf(pdf_path_str: str, cache_dir_str: str, chunk_size: int,
                                    label="ambiguous")
         analyzer = build_batch_analyzer(model_name, gaz_names, gazetteer_score,
                                         ambiguous)
+        # v7: the gazetteer doubles as training data for the OCR-debris
+        # n-gram model. No gazetteer, no model -- garbage rules then run
+        # exactly as in v6.
+        set_garbage_model(gaz_names)
 
         # Ask the pipeline for ORGANIZATION/LOCATION alongside PERSON.
         # These are never reported as names -- they are filtered out
@@ -2967,6 +3337,14 @@ def run_scan(args) -> list:
             f"entries, score {args.gazetteer_score}.",
             file=sys.stderr,
         )
+        ngm = NameNgramModel(gaz_names)
+        print(
+            f"OCR-debris n-gram model: trained on {ngm.calibration_size} "
+            f"names; signal below {ngm.signal_threshold:.3f} "
+            f"(p{NGRAM_SIGNAL_PERCENTILE}), convict below "
+            f"{ngm.convict_threshold:.3f} (p{NGRAM_CONVICT_PERCENTILE}).",
+            file=sys.stderr,
+        )
     elif not gazetteer_paths:
         print(
             "No --gazetteer supplied; dictionary recogniser disabled "
@@ -3071,12 +3449,37 @@ def run_scan(args) -> list:
 # ---------------------------------------------------------------------
 # Phase 2 -- report
 # ---------------------------------------------------------------------
-def tier_for(confidence: float, certain: float, light: float) -> str:
+# Graded rescue (v7). A name is withheld only if EVERY occurrence was
+# suppressed; one clean sighting rescues it. That rule is kept -- it is
+# what keeps Nurse Bell in the report -- but a rescue used to be
+# all-or-nothing: "Bell" read as an eponym in 49 of 50 places and as a
+# person in one landed in essentially_certain with nothing on the row to
+# say so. Now the share of suppressed occurrences is reported as
+# suppressed_fraction and caps the tier:
+#
+#   >= RESCUE_LIGHT_FRACTION      never above light_review
+#   >= RESCUE_EXTENSIVE_FRACTION  never above extensive_review
+#
+# Caps, not penalties, so the confidence column still means what it
+# meant; the tier is where a reviewer's time is allocated, and a name
+# that is mostly an eponym should not be at the front of the queue.
+RESCUE_LIGHT_FRACTION = 0.50
+RESCUE_EXTENSIVE_FRACTION = 0.80
+
+
+def tier_for(confidence: float, certain: float, light: float,
+             suppressed_fraction: float = 0.0) -> str:
     if confidence >= certain:
-        return TIER_CERTAIN
-    if confidence >= light:
+        tier = TIER_CERTAIN
+    elif confidence >= light:
+        tier = TIER_LIGHT
+    else:
+        tier = TIER_EXTENSIVE
+    if suppressed_fraction >= RESCUE_EXTENSIVE_FRACTION:
+        return TIER_EXTENSIVE
+    if suppressed_fraction >= RESCUE_LIGHT_FRACTION and tier == TIER_CERTAIN:
         return TIER_LIGHT
-    return TIER_EXTENSIVE
+    return tier
 
 
 def load_cache(cache_dir: Path):
@@ -3339,10 +3742,18 @@ def write_report(records, flags, file_stats, args, scan_summaries):
         # note on the records defaultdict in load_cache.
         hits = rec.get("hit_count", 0)
         suppressed = bool(hits) and rec.get("suppressed_hits", 0) >= hits
+        frac = (rec.get("suppressed_hits", 0) / hits) if hits else 0.0
         rows.append({
             "name": csv_safe(rec["display"]),
-            "tier": tier_for(conf, args.certain_threshold, args.light_threshold),
+            "tier": tier_for(conf, args.certain_threshold, args.light_threshold,
+                             frac),
             "confidence": round(conf, 3),
+            "suppressed_fraction": round(frac, 2) if frac else "",
+            # Reasons that fired on the suppressed MINORITY of a rescued
+            # name -- the reviewer can see "eponym on 48 pages, person on
+            # 2" without opening the sidecar.
+            "rescued_from": "; ".join(sorted(rec.get("suppress_reasons", ())))[:300]
+                            if (frac and not suppressed) else "",
             "possible_minor": "yes" if rec["possible_minor"] else "",
             "minor_tier": rec["minor_tier"],
             "minor_binding": rec["minor_binding"],
@@ -3384,6 +3795,8 @@ def write_report(records, flags, file_stats, args, scan_summaries):
         # v5 columns, appended last so existing positional consumers of
         # the CSV keep working.
         "suppressed", "suppress_reason", "also_reported_as",
+        # v7: graded rescue.
+        "suppressed_fraction", "rescued_from",
     ]
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -3425,6 +3838,11 @@ def write_report(records, flags, file_stats, args, scan_summaries):
         "suppressed_csv": str(args.out.with_suffix(".suppressed.csv")),
         "suppression": {
             "include_suppressed": include_suppressed,
+            "rescue_caps": {
+                "light_review_at": RESCUE_LIGHT_FRACTION,
+                "extensive_review_at": RESCUE_EXTENSIVE_FRACTION,
+            },
+            "names_rescued": sum(1 for r in main_rows if r["rescued_from"]),
             "names_withheld": len(held_rows),
             "by_reason": dict(suppress_counts),
             "occurrences_withheld": sum(r["occurrence_count"] for r in held_rows),
